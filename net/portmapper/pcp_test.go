@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -31,6 +32,14 @@ func startMockPCPGateway(t *testing.T) (*net.UDPConn, net.IP, int) {
 			version := buf[0]
 			opcode := buf[1]
 			if version != 2 || opcode != 1 { // MAP
+				// ANNOUNCE 探测：零副作用返回外部 IP
+				if version == 2 && opcode == 0 && n >= 60 {
+					resp := make([]byte, 60)
+					resp[0] = 2
+					resp[1] = 0x80
+					copy(resp[44:60], net.ParseIP("198.51.100.1").To16())
+					_, _ = conn.WriteToUDP(resp, remoteAddr)
+				}
 				continue
 			}
 
@@ -173,5 +182,70 @@ func TestPCP_Errors(t *testing.T) {
 				t.Errorf("code %d: expected %v, got %v", tt.code, tt.err, err)
 			}
 		}
+	}
+}
+
+func TestPCPProbeUsesAnnounce(t *testing.T) {
+	var zeroLifetimeMaps atomic.Int32
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, remote, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 || buf[0] != pcpVersion {
+				continue
+			}
+			var resp []byte
+			switch buf[1] {
+			case pcpOpcodeAnnounce: // ANNOUNCE 探测：零副作用返回外部 IP
+				resp = make([]byte, 60)
+				resp[1] = pcpOpcodeAnnounce | pcpRespMask
+				copy(resp[44:60], net.IPv4(203, 0, 113, 7).To16())
+			case pcpOpcodeMap:
+				if binary.BigEndian.Uint32(buf[4:8]) == 0 {
+					zeroLifetimeMaps.Add(1) // 不应出现：探测不允许携带删除语义
+					continue
+				}
+				resp = make([]byte, 60)
+				resp[1] = pcpOpcodeMap | pcpRespMask
+				copy(resp[24:44], buf[24:44])
+				binary.BigEndian.PutUint32(resp[4:8], 3600)
+				copy(resp[44:60], net.IPv4(203, 0, 113, 7).To16())
+			default:
+				continue
+			}
+			resp[0] = pcpVersion
+			_, _ = conn.WriteToUDP(resp, remote)
+		}
+	}()
+
+	cfg := DefaultConfig()
+	cfg.GatewayIP = net.IPv4(127, 0, 0, 1)
+	cfg.LocalIP = cfg.GatewayIP
+	cfg.PCPPort = port
+	cfg.ProbeTimeout = 300 * time.Millisecond
+	cfg.PreferredProviders = []Provider{ProviderPCP}
+	pm, _ := New(cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	m, err := pm.Discover(ctx, 12345, 12345)
+	if err != nil {
+		t.Fatalf("支持正常 MAP 的网关应被探测接受：%v", err)
+	}
+	if got := zeroLifetimeMaps.Load(); got != 0 {
+		t.Fatalf("探测阶段发出了 %d 个零租期 MAP（删除语义）请求", got)
+	}
+	if m.Provider != ProviderPCP || m.ExternalPort != 12345 {
+		t.Fatalf("映射结果异常：%+v", m)
 	}
 }

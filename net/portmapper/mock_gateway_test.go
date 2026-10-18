@@ -183,6 +183,19 @@ func (mg *MockGateway) handlePCP(req []byte, remote *net.UDPAddr) {
 		return
 	}
 	opcode := req[1]
+
+	// ANNOUNCE：零副作用探测，返回外部 IP
+	if opcode == pcpOpcodeAnnounce {
+		resp := make([]byte, 60)
+		resp[0] = pcpVersion
+		resp[1] = pcpOpcodeAnnounce | pcpRespMask
+		resp[3] = mg.opts.PCPResultCode
+		binary.BigEndian.PutUint32(resp[8:12], 54321)
+		copy(resp[44:60], mg.opts.ExternalIP.To16())
+		_, _ = mg.udpConn.WriteToUDP(resp, remote)
+		return
+	}
+
 	if opcode != pcpOpcodeMap {
 		return
 	}
