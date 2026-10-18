@@ -333,13 +333,24 @@ func TestPortMapper_AutoRenew(t *testing.T) {
 func TestMapping_AutoRenew_NonPositiveIntervalOrLifetime(t *testing.T) {
 	ctx := context.Background()
 
+	checkNoRenewalState := func(m *Mapping, desc string) {
+		t.Helper()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.renewCancel != nil {
+			t.Fatalf("%s: expected no renewal state created, got non-nil renewCancel", desc)
+		}
+	}
+
 	// 1. Lifetime == 0 (如 UPnP 永久租约降级)
 	m1 := &Mapping{Lifetime: 0}
 	stop1 := m1.AutoRenew(ctx, 10*time.Minute)
 	if stop1 == nil {
 		t.Fatal("expected non-nil stop func for Lifetime == 0")
 	}
+	checkNoRenewalState(m1, "Lifetime == 0")
 	stop1()
+	stop1() // 验证幂等执行
 
 	// 2. interval == 0 (如调用方按 mapping.Lifetime / 2 计算，当 Lifetime 为 0 时 interval 为 0)
 	m2 := &Mapping{Lifetime: 10 * time.Minute}
@@ -347,6 +358,7 @@ func TestMapping_AutoRenew_NonPositiveIntervalOrLifetime(t *testing.T) {
 	if stop2 == nil {
 		t.Fatal("expected non-nil stop func for interval == 0")
 	}
+	checkNoRenewalState(m2, "interval == 0")
 	stop2()
 
 	// 3. 负数 interval
@@ -355,6 +367,7 @@ func TestMapping_AutoRenew_NonPositiveIntervalOrLifetime(t *testing.T) {
 	if stop3 == nil {
 		t.Fatal("expected non-nil stop func for negative interval")
 	}
+	checkNoRenewalState(m3, "negative interval")
 	stop3()
 
 	// 4. Lifetime < 0
@@ -363,10 +376,85 @@ func TestMapping_AutoRenew_NonPositiveIntervalOrLifetime(t *testing.T) {
 	if stop4 == nil {
 		t.Fatal("expected non-nil stop func for negative lifetime")
 	}
+	checkNoRenewalState(m4, "negative lifetime")
 	stop4()
 
 	// 等待短暂时间确保若有泄漏启动的 goroutine 不会在后台 panic
 	time.Sleep(20 * time.Millisecond)
+}
+
+type stubRenewClient struct {
+	calls   atomic.Int32
+	first   chan struct{}
+	again   chan struct{}
+	granted time.Duration
+}
+
+func (*stubRenewClient) Provider() Provider { return ProviderUPnP }
+func (*stubRenewClient) GetExternalIP(context.Context) (net.IP, error) {
+	return net.IPv4(203, 0, 113, 7), nil
+}
+func (*stubRenewClient) AddPortMapping(context.Context, Protocol, int, int, time.Duration) (*Mapping, error) {
+	return nil, errors.New("not implemented")
+}
+func (*stubRenewClient) DeletePortMapping(context.Context, *Mapping) error { return nil }
+func (*stubRenewClient) Close() error                                      { return nil }
+func (c *stubRenewClient) RenewMapping(_ context.Context, m *Mapping, _ time.Duration) (*Mapping, error) {
+	n := c.calls.Add(1)
+	if n == 1 {
+		close(c.first)
+	} else if n == 2 {
+		close(c.again)
+	}
+	return &Mapping{
+		Protocol:     m.Protocol,
+		InternalPort: m.InternalPort,
+		ExternalPort: m.ExternalPort,
+		Lifetime:     c.granted,
+		Provider:     m.Provider,
+	}, nil
+}
+
+func TestMapping_AutoRenew_StopsWhenLeaseBecomesPermanent(t *testing.T) {
+	c := &stubRenewClient{
+		first:   make(chan struct{}),
+		again:   make(chan struct{}),
+		granted: 0, // 第一次续租网关返回永久租约 (0)
+	}
+	m := &Mapping{
+		client:       c,
+		Protocol:     ProtocolTCP,
+		InternalPort: 8080,
+		ExternalPort: 8080,
+		Lifetime:     time.Minute,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stop := m.AutoRenew(ctx, 5*time.Millisecond)
+	defer stop()
+
+	select {
+	case <-c.first:
+	case <-ctx.Done():
+		t.Fatal("超时：初次续租未触发")
+	}
+
+	m.mu.Lock()
+	lifetime := m.Lifetime
+	m.mu.Unlock()
+	if lifetime != 0 {
+		t.Fatalf("预期续租后租期为 0 (永久租约)，实际为 %v", lifetime)
+	}
+
+	// 确认变为永久租约后，后台协程自动退出，不再发起第二次续租
+	select {
+	case <-c.again:
+		t.Fatal("转为永久租约后后台协程仍在继续发起续租")
+	case <-time.After(50 * time.Millisecond):
+		// 预期不应触发第二次续租
+	}
 }
 
 func TestPortMapper_ReleaseAll(t *testing.T) {
