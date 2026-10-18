@@ -105,6 +105,7 @@ type Mapping struct {
 
 	released    bool
 	renewCancel context.CancelFunc
+	onRelease   func()
 }
 
 // ExternalAddr 返回外部完整地址（IP:Port）。
@@ -149,23 +150,32 @@ func (m *Mapping) Renew(ctx context.Context, lifetime time.Duration) error {
 }
 
 // Release 显式清理并注销网关上的端口映射。
+// 仅当网关删除成功才标记为已释放；删除失败时保持可重试状态，
+// 重试前自动续期已被终止（租约到期后网关会自然回收）。
 func (m *Mapping) Release(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.released {
+		m.mu.Unlock()
 		return nil
 	}
 	if m.renewCancel != nil {
 		m.renewCancel()
 		m.renewCancel = nil
 	}
-	m.released = true
-
-	if m.client == nil {
-		return nil
+	var err error
+	if m.client != nil {
+		err = m.client.DeletePortMapping(ctx, m)
 	}
-	return m.client.DeletePortMapping(ctx, m)
+	if err == nil {
+		m.released = true
+	}
+	hook := m.onRelease
+	m.mu.Unlock()
+
+	if err == nil && hook != nil {
+		hook()
+	}
+	return err
 }
 
 // IsReleased 检查该映射是否已被注销。

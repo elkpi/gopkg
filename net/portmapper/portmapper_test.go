@@ -4,9 +4,101 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestMappingReleaseRetryAfterFailure(t *testing.T) {
+	var deletes atomic.Int32
+	var failFirst = int32(1)
+	client := &stubClient{
+		deleteFn: func() error {
+			if deletes.Add(1) == 1 && atomic.LoadInt32(&failFirst) == 1 {
+				return errors.New("临时删除失败")
+			}
+			return nil
+		},
+	}
+	m := &Mapping{client: client}
+
+	if err := m.Release(context.Background()); err == nil {
+		t.Fatal("首次删除失败应上抛错误")
+	}
+	if m.IsReleased() {
+		t.Fatal("删除失败时不应标记为已释放，否则无法重试")
+	}
+	if err := m.Release(context.Background()); err != nil {
+		t.Fatalf("第二次 Release 应重试删除：%v", err)
+	}
+	if got := deletes.Load(); got != 2 {
+		t.Fatalf("期望 Delete 被调用 2 次，实际 %d 次", got)
+	}
+}
+
+// stubClient 实现仅用于生命周期测试的 Client。
+type stubClient struct {
+	deleteFn func() error
+}
+
+func (*stubClient) Provider() Provider { return ProviderNATPMP }
+func (*stubClient) GetExternalIP(context.Context) (net.IP, error) {
+	return net.IPv4(203, 0, 113, 7), nil
+}
+func (s *stubClient) DeletePortMapping(context.Context, *Mapping) error { return s.deleteFn() }
+func (*stubClient) RenewMapping(context.Context, *Mapping, time.Duration) (*Mapping, error) {
+	return nil, errors.New("not implemented")
+}
+func (*stubClient) Close() error { return nil }
+
+func (s *stubClient) AddPortMapping(_ context.Context, proto Protocol, internal, external int, lifetime time.Duration) (*Mapping, error) {
+	return &Mapping{
+		Protocol:     proto,
+		InternalPort: internal,
+		ExternalPort: external,
+		Lifetime:     lifetime,
+		Provider:     ProviderNATPMP,
+	}, nil
+}
+
+func TestPortMapperConcurrentDiscoverTracksAll(t *testing.T) {
+	pm, _ := New(DefaultConfig())
+	pm.mu.Lock()
+	pm.cachedClient = &stubClient{deleteFn: func() error { return nil }}
+	pm.mu.Unlock()
+
+	const n = 1024
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _ = pm.Discover(context.Background(), 10000+i, 10000+i)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	pm.mu.Lock()
+	tracked := len(pm.activeMaps)
+	pm.mu.Unlock()
+	if tracked != n {
+		t.Fatalf("成功创建 %d 个映射，只跟踪到 %d 个，ReleaseAll 将遗漏", n, tracked)
+	}
+
+	if err := pm.ReleaseAll(context.Background()); err != nil {
+		t.Fatalf("ReleaseAll: %v", err)
+	}
+	pm.mu.Lock()
+	tracked = len(pm.activeMaps)
+	pm.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("释放后仍跟踪 %d 个映射", tracked)
+	}
+}
 
 func TestPortMapper_PCP_Priority(t *testing.T) {
 	opts := DefaultMockOptions()
