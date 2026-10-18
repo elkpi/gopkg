@@ -1,6 +1,7 @@
 package portmapper
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -103,6 +104,17 @@ func parsePCPResultCode(code uint8) error {
 	}
 }
 
+func pcpIANAProtocol(proto Protocol) (byte, error) {
+	switch proto {
+	case ProtocolTCP:
+		return pcpProtocolTCP, nil
+	case ProtocolUDP:
+		return pcpProtocolUDP, nil
+	default:
+		return 0, ErrUnsupportedProtocol
+	}
+}
+
 func toPCPAddress(ip net.IP) [16]byte {
 	var res [16]byte
 	if ip == nil {
@@ -202,16 +214,42 @@ func (c *PCPClient) sendAndRecv(ctx context.Context, req []byte, expectedOpcode 
 	return nil, fmt.Errorf("%w: PCP gateway %s timeout", ErrMappingFailed, c.gatewayIP)
 }
 
+// buildPCPMapRequest 构造 60 字节 MAP 请求。nonce 由调用方决定：
+// 新建映射时随机生成，续租/删除时必须复用原映射 nonce。
+func (c *PCPClient) buildPCPMapRequest(clientIP net.IP, nonce [12]byte, ianaProto byte, internalPort, externalPort int, lifetime time.Duration) []byte {
+	req := make([]byte, 60)
+	req[0] = pcpVersion
+	req[1] = pcpOpcodeMap
+	binary.BigEndian.PutUint32(req[4:8], uint32(lifetime.Seconds()))
+	clientIPBytes := toPCPAddress(clientIP)
+	copy(req[8:24], clientIPBytes[:])
+	copy(req[24:36], nonce[:])
+	req[36] = ianaProto
+	binary.BigEndian.PutUint16(req[40:42], uint16(internalPort))
+	binary.BigEndian.PutUint16(req[42:44], uint16(externalPort))
+	return req
+}
+
+// validatePCPMapResponse 按 RFC 6887 §11.4 校验响应与请求的关联字段
+// （nonce、协议、内部端口），不匹配视为畸形响应。
+func validatePCPMapResponse(resp, req []byte) error {
+	if !bytes.Equal(resp[24:36], req[24:36]) {
+		return fmt.Errorf("%w: response nonce does not match request", ErrMalformedResponse)
+	}
+	if resp[36] != req[36] {
+		return fmt.Errorf("%w: response protocol %d does not match request %d", ErrMalformedResponse, resp[36], req[36])
+	}
+	if binary.BigEndian.Uint16(resp[40:42]) != binary.BigEndian.Uint16(req[40:42]) {
+		return fmt.Errorf("%w: response internal port does not match request", ErrMalformedResponse)
+	}
+	return nil
+}
+
 // AddPortMapping 请求 PCP 端口映射（MAP OpCode）。
 func (c *PCPClient) AddPortMapping(ctx context.Context, proto Protocol, internalPort int, preferredExternal int, lifetime time.Duration) (*Mapping, error) {
-	var ianaProto byte
-	switch proto {
-	case ProtocolTCP:
-		ianaProto = pcpProtocolTCP
-	case ProtocolUDP:
-		ianaProto = pcpProtocolUDP
-	default:
-		return nil, ErrUnsupportedProtocol
+	ianaProto, err := pcpIANAProtocol(proto)
+	if err != nil {
+		return nil, err
 	}
 
 	clientIP, err := c.getClientIP()
@@ -219,29 +257,17 @@ func (c *PCPClient) AddPortMapping(ctx context.Context, proto Protocol, internal
 		return nil, err
 	}
 
-	// 报文结构：24 字节 Header + 36 字节 MAP Payload = 60 字节
-	req := make([]byte, 60)
-	req[0] = pcpVersion
-	req[1] = pcpOpcodeMap
-	// req[2:4] Reserved
-	binary.BigEndian.PutUint32(req[4:8], uint32(lifetime.Seconds()))
-	clientIPBytes := toPCPAddress(clientIP)
-	copy(req[8:24], clientIPBytes[:])
-
-	// MAP Payload
 	var nonce [12]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
-	copy(req[24:36], nonce[:])
-	req[36] = ianaProto
-	// req[37:40] Reserved
-	binary.BigEndian.PutUint16(req[40:42], uint16(internalPort))
-	binary.BigEndian.PutUint16(req[42:44], uint16(preferredExternal))
-	// req[44:60] Suggested External IP (默认全 0)
 
+	req := c.buildPCPMapRequest(clientIP, nonce, ianaProto, internalPort, preferredExternal, lifetime)
 	resp, err := c.sendAndRecv(ctx, req, pcpOpcodeMap, 60)
 	if err != nil {
+		return nil, err
+	}
+	if err := validatePCPMapResponse(resp, req); err != nil {
 		return nil, err
 	}
 
@@ -262,16 +288,45 @@ func (c *PCPClient) AddPortMapping(ctx context.Context, proto Protocol, internal
 	}, nil
 }
 
+// RenewMapping 复用原映射 nonce 续租（RFC 6887 §11.2.1）。
+func (c *PCPClient) RenewMapping(ctx context.Context, m *Mapping, lifetime time.Duration) (*Mapping, error) {
+	ianaProto, err := pcpIANAProtocol(m.Protocol)
+	if err != nil {
+		return nil, err
+	}
+
+	clientIP, err := c.getClientIP()
+	if err != nil {
+		return nil, err
+	}
+
+	req := c.buildPCPMapRequest(clientIP, m.nonce, ianaProto, m.InternalPort, m.ExternalPort, lifetime)
+	resp, err := c.sendAndRecv(ctx, req, pcpOpcodeMap, 60)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePCPMapResponse(resp, req); err != nil {
+		return nil, err
+	}
+
+	return &Mapping{
+		client:       c,
+		Protocol:     m.Protocol,
+		InternalPort: m.InternalPort,
+		ExternalPort: int(binary.BigEndian.Uint16(resp[42:44])),
+		ExternalIP:   fromPCPAddress(resp[44:60]),
+		Lifetime:     time.Duration(binary.BigEndian.Uint32(resp[4:8])) * time.Second,
+		CreatedAt:    time.Now(),
+		Provider:     ProviderPCP,
+		nonce:        m.nonce,
+	}, nil
+}
+
 // DeletePortMapping 删除 PCP 端口映射（Lifetime = 0，复用相同 Nonce）。
 func (c *PCPClient) DeletePortMapping(ctx context.Context, m *Mapping) error {
-	var ianaProto byte
-	switch m.Protocol {
-	case ProtocolTCP:
-		ianaProto = pcpProtocolTCP
-	case ProtocolUDP:
-		ianaProto = pcpProtocolUDP
-	default:
-		return ErrUnsupportedProtocol
+	ianaProto, err := pcpIANAProtocol(m.Protocol)
+	if err != nil {
+		return err
 	}
 
 	clientIP, err := c.getClientIP()
@@ -279,21 +334,12 @@ func (c *PCPClient) DeletePortMapping(ctx context.Context, m *Mapping) error {
 		return err
 	}
 
-	req := make([]byte, 60)
-	req[0] = pcpVersion
-	req[1] = pcpOpcodeMap
-	binary.BigEndian.PutUint32(req[4:8], 0) // Lifetime = 0
-	clientIPBytes := toPCPAddress(clientIP)
-	copy(req[8:24], clientIPBytes[:])
-
-	// 必须使用相同的 Nonce
-	copy(req[24:36], m.nonce[:])
-	req[36] = ianaProto
-	binary.BigEndian.PutUint16(req[40:42], uint16(m.InternalPort))
-	binary.BigEndian.PutUint16(req[42:44], uint16(m.ExternalPort))
-
-	_, err = c.sendAndRecv(ctx, req, pcpOpcodeMap, 60)
-	return err
+	req := c.buildPCPMapRequest(clientIP, m.nonce, ianaProto, m.InternalPort, m.ExternalPort, 0)
+	resp, err := c.sendAndRecv(ctx, req, pcpOpcodeMap, 60)
+	if err != nil {
+		return err
+	}
+	return validatePCPMapResponse(resp, req)
 }
 
 // GetExternalIP 通过 ANNOUNCE 探测网关并获取其外部 IP。

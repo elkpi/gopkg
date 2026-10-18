@@ -213,6 +213,11 @@ func (c *NATPMPClient) AddPortMapping(ctx context.Context, proto Protocol, inter
 	}, nil
 }
 
+// RenewMapping 以原内外端口重新请求映射（NAT-PMP 无 nonce 概念）。
+func (c *NATPMPClient) RenewMapping(ctx context.Context, m *Mapping, lifetime time.Duration) (*Mapping, error) {
+	return c.AddPortMapping(ctx, m.Protocol, m.InternalPort, m.ExternalPort, lifetime)
+}
+
 // DeletePortMapping 删除指定的端口映射（Lifetime 置 0）。
 func (c *NATPMPClient) DeletePortMapping(ctx context.Context, m *Mapping) error {
 	var op byte

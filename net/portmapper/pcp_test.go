@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -182,6 +183,124 @@ func TestPCP_Errors(t *testing.T) {
 				t.Errorf("code %d: expected %v, got %v", tt.code, tt.err, err)
 			}
 		}
+	}
+}
+
+// startStrictPCPGateway 模拟按 RFC 6887 §11.3/§11.4 严格校验 nonce 的网关：
+// 对已存在的映射，续租请求必须携带创建时的 nonce，否则返回 NOT_AUTHORIZED。
+func startStrictPCPGateway(t *testing.T) (net.IP, int) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	var mu sync.Mutex
+	byInternal := map[uint16][12]byte{}
+
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, remote, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 60 || buf[0] != pcpVersion || buf[1] != pcpOpcodeMap {
+				continue
+			}
+			internal := binary.BigEndian.Uint16(buf[40:42])
+			var nonce [12]byte
+			copy(nonce[:], buf[24:36])
+
+			resp := make([]byte, 60)
+			resp[0] = pcpVersion
+			resp[1] = pcpOpcodeMap | pcpRespMask
+			copy(resp[24:44], buf[24:44])
+			copy(resp[44:60], net.IPv4(203, 0, 113, 7).To16())
+
+			mu.Lock()
+			known, exists := byInternal[internal]
+			mu.Unlock()
+			if exists && known != nonce {
+				resp[3] = 2 // NOT_AUTHORIZED
+			} else {
+				binary.BigEndian.PutUint32(resp[4:8], binary.BigEndian.Uint32(buf[4:8]))
+				if binary.BigEndian.Uint32(buf[4:8]) > 0 {
+					mu.Lock()
+					byInternal[internal] = nonce
+					mu.Unlock()
+				} else {
+					mu.Lock()
+					delete(byInternal, internal)
+					mu.Unlock()
+				}
+			}
+			_, _ = conn.WriteToUDP(resp, remote)
+		}
+	}()
+
+	return net.IPv4(127, 0, 0, 1), conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func TestPCPRenewReusesOriginalNonce(t *testing.T) {
+	ip, port := startStrictPCPGateway(t)
+	client, err := NewPCPClientWithPort(ip, ip, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	m, err := client.AddPortMapping(ctx, ProtocolTCP, 12345, 12345, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Renew(ctx, 2*time.Hour); err != nil {
+		t.Fatalf("严格网关应接受复用原 nonce 的续租：%v", err)
+	}
+	if err := client.DeletePortMapping(ctx, m); err != nil {
+		t.Fatalf("续租后应仍能以原 nonce 释放：%v", err)
+	}
+}
+
+func TestPCPRejectsMismatchedResponseNonce(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, remote, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 60 || buf[0] != pcpVersion || buf[1] != pcpOpcodeMap {
+				continue
+			}
+			resp := make([]byte, 60)
+			copy(resp, buf[:n])
+			resp[1] |= pcpRespMask
+			resp[3] = 0
+			resp[24] ^= 0xff // 篡改响应 nonce
+			copy(resp[44:60], net.IPv4(203, 0, 113, 7).To16())
+			_, _ = conn.WriteToUDP(resp, remote)
+		}
+	}()
+
+	client, _ := NewPCPClientWithPort(net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 1), port)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	m, err := client.AddPortMapping(ctx, ProtocolTCP, 12345, 12345, time.Hour)
+	if err == nil {
+		t.Fatalf("接受了 nonce 与请求不符的响应：%+v", m)
 	}
 }
 
