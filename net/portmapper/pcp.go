@@ -296,28 +296,15 @@ func (c *PCPClient) DeletePortMapping(ctx context.Context, m *Mapping) error {
 	return err
 }
 
-// GetExternalIP 获取外部公网 IP。
+// GetExternalIP 通过 ANNOUNCE 探测网关并获取其外部 IP。
+// ANNOUNCE 无任何映射副作用；不可使用零租期 MAP 代替，
+// 那是对既有映射的删除语义（RFC 6887 §10、§11.2）。
 func (c *PCPClient) GetExternalIP(ctx context.Context) (net.IP, error) {
-	clientIP, err := c.getClientIP()
-	if err != nil {
-		return nil, err
-	}
-
 	req := make([]byte, 60)
 	req[0] = pcpVersion
-	req[1] = pcpOpcodeMap
-	binary.BigEndian.PutUint32(req[4:8], 0) // Lifetime = 0
-	clientIPBytes := toPCPAddress(clientIP)
-	copy(req[8:24], clientIPBytes[:])
+	req[1] = pcpOpcodeAnnounce
 
-	var nonce [12]byte
-	_, _ = rand.Read(nonce[:])
-	copy(req[24:36], nonce[:])
-	req[36] = pcpProtocolTCP
-	binary.BigEndian.PutUint16(req[40:42], 0)
-	binary.BigEndian.PutUint16(req[42:44], 0)
-
-	resp, err := c.sendAndRecv(ctx, req, pcpOpcodeMap, 60)
+	resp, err := c.sendAndRecv(ctx, req, pcpOpcodeAnnounce, 60)
 	if err != nil {
 		return nil, err
 	}
