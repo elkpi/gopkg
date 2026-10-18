@@ -2,11 +2,38 @@ package underlay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"syscall"
 )
+
+var ErrSocketType = errors.New("listener is not a UDP connection")
+
+// ControlSetter 是可注入的 SO_MARK 设置器，便于测试。
+type ControlSetter func(fd uintptr, value uint32) error
+
+// ControlWithSetter 返回 net.ListenConfig.Control 形状的回调；
+// setter 失败时套接字创建失败，保证“先标记、后发包”的顺序约束。
+func ControlWithSetter(mark uint32, setter ControlSetter) func(string, string, syscall.RawConn) error {
+	return func(network, address string, conn syscall.RawConn) error {
+		if mark == 0 {
+			return nil
+		}
+		var controlErr error
+		err := conn.Control(func(fd uintptr) {
+			controlErr = setter(fd, mark)
+		})
+		if err != nil {
+			return fmt.Errorf("socket control callback failed: %w", err)
+		}
+		if controlErr != nil {
+			return fmt.Errorf("failed to set SO_MARK: %w", controlErr)
+		}
+		return nil
+	}
+}
 
 // Factory 的 mark 为零时不设置 SO_MARK；非零时在首次发包前设置。
 // 每个实例的目的前缀约束同样覆盖 DNS 解析产生的连接。
@@ -103,4 +130,19 @@ func (f *Factory) Resolver() *net.Resolver {
 			return f.DialContext(ctx, network, address)
 		},
 	}
+}
+
+// ListenUDP 用带标记的控制回调创建 UDP 套接字。
+func ListenUDP(ctx context.Context, mark uint32, network, address string) (*net.UDPConn, error) {
+	lc := net.ListenConfig{Control: Control(mark)}
+	packetConn, err := lc.ListenPacket(ctx, network, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create marked UDP socket: %w", err)
+	}
+	udp, ok := packetConn.(*net.UDPConn)
+	if !ok {
+		packetConn.Close()
+		return nil, ErrSocketType
+	}
+	return udp, nil
 }
