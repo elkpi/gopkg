@@ -48,6 +48,9 @@ type Client interface {
 	Provider() Provider
 	GetExternalIP(ctx context.Context) (net.IP, error)
 	AddPortMapping(ctx context.Context, proto Protocol, internalPort int, preferredExternal int, lifetime time.Duration) (*Mapping, error)
+	// RenewMapping 续租 m 代表的映射。PCP 实现必须复用 m 创建时的 nonce，
+	// 以免被严格网关按 NOT_AUTHORIZED 拒绝。
+	RenewMapping(ctx context.Context, m *Mapping, lifetime time.Duration) (*Mapping, error)
 	DeletePortMapping(ctx context.Context, m *Mapping) error
 	Close() error
 }
@@ -130,7 +133,7 @@ func (m *Mapping) Renew(ctx context.Context, lifetime time.Duration) error {
 		return ErrMappingNotFound
 	}
 
-	newMapping, err := m.client.AddPortMapping(ctx, m.Protocol, m.InternalPort, m.ExternalPort, lifetime)
+	newMapping, err := m.client.RenewMapping(ctx, m, lifetime)
 	if err != nil {
 		return err
 	}
@@ -141,6 +144,7 @@ func (m *Mapping) Renew(ctx context.Context, lifetime time.Duration) error {
 	}
 	m.Lifetime = newMapping.Lifetime
 	m.CreatedAt = time.Now()
+	// m.nonce 保持不变：续租的映射身份与原映射相同。
 	return nil
 }
 

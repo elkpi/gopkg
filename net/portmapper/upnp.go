@@ -326,6 +326,11 @@ func (c *UPnPClient) AddPortMapping(ctx context.Context, proto Protocol, interna
 	}, nil
 }
 
+// RenewMapping 以相同内外端口重新提交 AddPortMapping 续租。
+func (c *UPnPClient) RenewMapping(ctx context.Context, m *Mapping, lifetime time.Duration) (*Mapping, error) {
+	return c.AddPortMapping(ctx, m.Protocol, m.InternalPort, m.ExternalPort, lifetime)
+}
+
 // DeletePortMapping 删除 UPnP 端口映射。
 func (c *UPnPClient) DeletePortMapping(ctx context.Context, m *Mapping) error {
 	args := fmt.Sprintf(`
