@@ -207,3 +207,21 @@ func TestAccumulatorSequenceWraparound(t *testing.T) {
 		t.Fatalf("failed to record probe with seq 0: ok=%v, rtt=%v", ok, rtt)
 	}
 }
+
+func TestAccumulatorLatePongIsDeterministic(t *testing.T) {
+	sent := time.Unix(1700000000, 0)
+	pongTime := sent.Add(2 * time.Second) // 超过 1 秒探针超时
+
+	direct := NewAccumulator(10, time.Second)
+	swept := NewAccumulator(10, time.Second)
+	direct.RecordProbeSent(1, sent)
+	swept.RecordProbeSent(1, sent)
+	// swept 在 Pong 到达前曾生成过快照（触发超时扫描）
+	swept.Snapshot(sent.Add(1500 * time.Millisecond))
+
+	_, okDirect := direct.RecordPongReceived(1, pongTime, sent.UnixNano())
+	_, okSwept := swept.RecordPongReceived(1, pongTime, sent.UnixNano())
+	if okDirect != okSwept {
+		t.Fatalf("迟到 Pong 的接受与否取决于是否调用过 Snapshot：未扫描=%v，已扫描=%v", okDirect, okSwept)
+	}
+}
