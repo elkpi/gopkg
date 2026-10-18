@@ -49,3 +49,12 @@ func TestRedactKeepsUnrelatedText(t *testing.T) {
 		t.Fatalf("无关内容被修改：%s", got)
 	}
 }
+
+func TestRedactPrefersLongestVariantAcrossSecrets(t *testing.T) {
+	long := "SYNTHETIC_PREFIX_PRIVATE_SUFFIX"
+	short := "SYNTHETIC_PREFIX"
+	got := securelog.Redact("token="+long, []string{short, long})
+	if strings.Contains(got, "PRIVATE_SUFFIX") {
+		t.Fatalf("短 secret 先替换导致长 secret 后缀残留：%s", got)
+	}
+}
