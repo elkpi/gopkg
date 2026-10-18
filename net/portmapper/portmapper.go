@@ -104,14 +104,32 @@ func (pm *PortMapper) DiscoverProtocol(ctx context.Context, proto Protocol, inte
 
 	pm.mu.Lock()
 	pm.cachedClient = client
-	pm.trackMapping(m)
 	pm.mu.Unlock()
+	pm.trackMapping(m)
 
 	return m, nil
 }
 
+// trackMapping 线程安全地登记映射，并在其释放后自动移出跟踪列表。
 func (pm *PortMapper) trackMapping(m *Mapping) {
+	pm.mu.Lock()
 	pm.activeMaps = append(pm.activeMaps, m)
+	pm.mu.Unlock()
+
+	m.mu.Lock()
+	m.onRelease = func() { pm.removeMapping(m) }
+	m.mu.Unlock()
+}
+
+func (pm *PortMapper) removeMapping(m *Mapping) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for i, tracked := range pm.activeMaps {
+		if tracked == m {
+			pm.activeMaps = append(pm.activeMaps[:i], pm.activeMaps[i+1:]...)
+			return
+		}
+	}
 }
 
 // probeProviders 实现 PCP / NAT-PMP 单播优先、UPnP 兜底的并发梯次探测机制。
