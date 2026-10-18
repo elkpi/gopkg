@@ -8,8 +8,8 @@
 - **导入路径**：`github.com/elkpi/gopkg/net/qos`
 - **特性**：
   - 纯 Go 标准库实现，零外部依赖，极低内存分配；
-  - 严格实现 **RFC 6298** EWMA 平滑 RTT 统计；
-  - 严格实现 **RFC 3550** 抖动方差（Mean Deviation Jitter）统计；
+  - 参考 **RFC 6298** 的 EWMA 平滑 RTT 统计（α=0.2 为刻意调参，非 RFC 默认 1/8）；
+  - 参考 **RFC 3550** 抖动方差（Mean Deviation Jitter）统计；
   - 基于可配置大小的滑动窗口自动聚合计算实时丢包率（`LossRate`）；
   - 适合用于实时链路健康探测、多路径动态切换（Multi-path steering）与 RPC 节点健康度打分。
 
