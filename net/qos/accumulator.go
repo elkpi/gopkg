@@ -96,6 +96,8 @@ func (a *Accumulator) RecordProbeSent(seq uint32, sendTime time.Time) {
 }
 
 // RecordPongReceived 记录接收到的 Pong 并更新 RTT 与 RFC 3550 抖动。
+// 若 Pong 在 probeTimeout 之后才到达，无论是否调用过 Snapshot/SweepTimeouts，
+// 一律判定丢失并拒绝计入统计。
 func (a *Accumulator) RecordPongReceived(seq uint32, recvTime time.Time, sendNanos int64) (time.Duration, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -107,13 +109,18 @@ func (a *Accumulator) RecordPongReceived(seq uint32, recvTime time.Time, sendNan
 		return 0, false
 	}
 
+	sentTime := slot.sendTime
+	if sentTime.IsZero() && sendNanos > 0 {
+		sentTime = time.Unix(0, sendNanos)
+	}
+	if !sentTime.IsZero() && recvTime.Sub(sentTime) >= a.probeTimeout {
+		slot.status = statusLost
+		return 0, false
+	}
+
 	slot.status = statusSuccess
 	var rtt time.Duration
-	if !slot.sendTime.IsZero() {
-		rtt = recvTime.Sub(slot.sendTime)
-	}
-	if rtt <= 0 && sendNanos > 0 {
-		sentTime := time.Unix(0, sendNanos)
+	if !sentTime.IsZero() {
 		rtt = recvTime.Sub(sentTime)
 	}
 	if rtt < 0 {
