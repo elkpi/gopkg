@@ -330,6 +330,45 @@ func TestPortMapper_AutoRenew(t *testing.T) {
 	_ = m.Release(ctx)
 }
 
+func TestMapping_AutoRenew_NonPositiveIntervalOrLifetime(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Lifetime == 0 (如 UPnP 永久租约降级)
+	m1 := &Mapping{Lifetime: 0}
+	stop1 := m1.AutoRenew(ctx, 10*time.Minute)
+	if stop1 == nil {
+		t.Fatal("expected non-nil stop func for Lifetime == 0")
+	}
+	stop1()
+
+	// 2. interval == 0 (如调用方按 mapping.Lifetime / 2 计算，当 Lifetime 为 0 时 interval 为 0)
+	m2 := &Mapping{Lifetime: 10 * time.Minute}
+	stop2 := m2.AutoRenew(ctx, 0)
+	if stop2 == nil {
+		t.Fatal("expected non-nil stop func for interval == 0")
+	}
+	stop2()
+
+	// 3. 负数 interval
+	m3 := &Mapping{Lifetime: 10 * time.Minute}
+	stop3 := m3.AutoRenew(ctx, -1*time.Second)
+	if stop3 == nil {
+		t.Fatal("expected non-nil stop func for negative interval")
+	}
+	stop3()
+
+	// 4. Lifetime < 0
+	m4 := &Mapping{Lifetime: -1 * time.Second}
+	stop4 := m4.AutoRenew(ctx, 10*time.Minute)
+	if stop4 == nil {
+		t.Fatal("expected non-nil stop func for negative lifetime")
+	}
+	stop4()
+
+	// 等待短暂时间确保若有泄漏启动的 goroutine 不会在后台 panic
+	time.Sleep(20 * time.Millisecond)
+}
+
 func TestPortMapper_ReleaseAll(t *testing.T) {
 	opts := DefaultMockOptions()
 	opts.EnablePCP = true

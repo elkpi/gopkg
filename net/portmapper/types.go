@@ -186,10 +186,12 @@ func (m *Mapping) IsReleased() bool {
 }
 
 // AutoRenew 启动后台协程自动定期为映射续期（按 interval 周期执行）。
+// 若当前映射已释放、租期为永久/非正数（Lifetime <= 0）或传入的 interval <= 0，
+// 则不启动任何后台 ticker 或协程，直接返回安全的空操作闭包。
 // 返回的 stop 函数用于主动停止自动续期。
 func (m *Mapping) AutoRenew(ctx context.Context, interval time.Duration) (stop func()) {
 	m.mu.Lock()
-	if m.released {
+	if m.released || m.Lifetime <= 0 || interval <= 0 {
 		m.mu.Unlock()
 		return func() {}
 	}
@@ -213,7 +215,7 @@ func (m *Mapping) AutoRenew(ctx context.Context, interval time.Duration) (stop f
 				released := m.released
 				lifetime := m.Lifetime
 				m.mu.Unlock()
-				if released {
+				if released || lifetime <= 0 {
 					return
 				}
 				_ = m.Renew(renewCtx, lifetime)
