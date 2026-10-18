@@ -39,9 +39,9 @@ gofmt -s -w .
 
 ### Foundational Pillars
 
-- **`net/qos` (RFC 6298 & RFC 3550 Network Telemetry)**:
+- **`net/qos` (RFC 6298-style & RFC 3550-style Network Telemetry)**:
   - High-precision sliding window quality accumulator.
-  - Computes EWMA smoothed RTT (RFC 6298), mean deviation jitter (RFC 3550), and real-time packet loss rates (`LossRate`). Thread-safe with low allocation overhead.
+  - Computes EWMA smoothed RTT (RFC 6298-style, deliberately tuned α=0.2 instead of the RFC's 1/8), mean deviation jitter (RFC 3550-style), and real-time packet loss rates (`LossRate`). Thread-safe with low allocation overhead.
 
 - **`net/underlay` (Linux Low-Level Socket Manipulation)**:
   - Linux `SO_MARK` socket isolation factory for policy-based routing.
