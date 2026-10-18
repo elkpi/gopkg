@@ -218,7 +218,14 @@ func (m *Mapping) AutoRenew(ctx context.Context, interval time.Duration) (stop f
 				if released || lifetime <= 0 {
 					return
 				}
-				_ = m.Renew(renewCtx, lifetime)
+				if err := m.Renew(renewCtx, lifetime); err == nil {
+					m.mu.Lock()
+					isPermanent := m.Lifetime <= 0
+					m.mu.Unlock()
+					if isPermanent {
+						return
+					}
+				}
 			}
 		}
 	}()
