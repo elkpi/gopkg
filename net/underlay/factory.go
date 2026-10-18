@@ -71,8 +71,9 @@ func (f *Factory) ListenUDP(ctx context.Context, network, address string) (*net.
 }
 
 // DialContext 创建带标记的出站连接；控制回调失败时连接建立失败。
+// 解析域名时同样经由带标记的 Resolver，避免 DNS 查询绕过路由标记。
 func (f *Factory) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	dialer := net.Dialer{Control: f.control()}
+	dialer := net.Dialer{Control: f.control(), Resolver: f.Resolver()}
 	if len(f.protected) != 0 {
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
