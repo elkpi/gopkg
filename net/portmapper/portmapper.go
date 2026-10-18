@@ -90,24 +90,35 @@ func (pm *PortMapper) DiscoverProtocol(ctx context.Context, proto Protocol, inte
 		pm.mu.Unlock()
 	}
 
-	// 2. 执行梯次并发探测
-	client, err := pm.probeProviders(ctx)
-	if err != nil {
-		return nil, err
+	// 2. 梯次并发探测；探测成功的协议若在实际映射时失败，逐级降级重试
+	excluded := make(map[Provider]bool)
+	var lastErr error
+	for {
+		client, err := pm.probeProviders(ctx, excluded)
+		if err != nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("%w (last mapping error: %v)", err, lastErr)
+			}
+			return nil, err
+		}
+
+		// 3. 执行映射请求
+		m, err := client.AddPortMapping(ctx, proto, internalPort, preferredExternal, pm.cfg.DefaultLifetime)
+		if err == nil {
+			pm.mu.Lock()
+			pm.cachedClient = client
+			pm.mu.Unlock()
+			pm.trackMapping(m)
+			return m, nil
+		}
+
+		lastErr = err
+		excluded[client.Provider()] = true
+		_ = client.Close()
+		if len(excluded) >= len(pm.cfg.PreferredProviders) {
+			return nil, err
+		}
 	}
-
-	// 3. 执行映射请求
-	m, err := client.AddPortMapping(ctx, proto, internalPort, preferredExternal, pm.cfg.DefaultLifetime)
-	if err != nil {
-		return nil, err
-	}
-
-	pm.mu.Lock()
-	pm.cachedClient = client
-	pm.mu.Unlock()
-	pm.trackMapping(m)
-
-	return m, nil
 }
 
 // trackMapping 线程安全地登记映射，并在其释放后自动移出跟踪列表。
@@ -133,14 +144,15 @@ func (pm *PortMapper) removeMapping(m *Mapping) {
 }
 
 // probeProviders 实现 PCP / NAT-PMP 单播优先、UPnP 兜底的并发梯次探测机制。
-func (pm *PortMapper) probeProviders(ctx context.Context) (Client, error) {
+// excluded 中的协议不参与本轮探测，用于映射失败后的降级重试。
+func (pm *PortMapper) probeProviders(ctx context.Context, excluded map[Provider]bool) (Client, error) {
 	gatewayIP := pm.cfg.GatewayIP
 	if gatewayIP == nil {
 		var gwErr error
 		gatewayIP, gwErr = DiscoverDefaultGateway()
 		if gwErr != nil {
 			// 若未发现网关 IP，但支持 UPnP，则直接尝试 UPnP 组播发现
-			if pm.supportsProvider(ProviderUPnP) {
+			if pm.supportsProvider(ProviderUPnP) && !excluded[ProviderUPnP] {
 				upnpClient, err := DiscoverUPnPGateway(ctx, pm.cfg.HTTPClient)
 				if err == nil {
 					return upnpClient, nil
@@ -164,7 +176,7 @@ func (pm *PortMapper) probeProviders(ctx context.Context) (Client, error) {
 	defer cancelUnicast()
 
 	// 1. 启动单播探测（PCP / NAT-PMP）
-	if pm.supportsProvider(ProviderPCP) {
+	if pm.supportsProvider(ProviderPCP) && !excluded[ProviderPCP] {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -184,7 +196,7 @@ func (pm *PortMapper) probeProviders(ctx context.Context) (Client, error) {
 		}()
 	}
 
-	if pm.supportsProvider(ProviderNATPMP) {
+	if pm.supportsProvider(ProviderNATPMP) && !excluded[ProviderNATPMP] {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -205,7 +217,7 @@ func (pm *PortMapper) probeProviders(ctx context.Context) (Client, error) {
 	}
 
 	// 2. 梯次启动 UPnP 探测（若单播优先，稍作等待或并发兜底）
-	if pm.supportsProvider(ProviderUPnP) {
+	if pm.supportsProvider(ProviderUPnP) && !excluded[ProviderUPnP] {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -253,6 +265,9 @@ func (pm *PortMapper) probeProviders(ctx context.Context) (Client, error) {
 
 		// 按首选顺序检查当前可决策的最高优先级结果
 		for _, p := range pm.cfg.PreferredProviders {
+			if excluded[p] {
+				continue
+			}
 			if c, ok := results[p]; ok {
 				// 高优先级协议已成功完成，立即选定并返回
 				selected = c
@@ -267,6 +282,9 @@ func (pm *PortMapper) probeProviders(ctx context.Context) (Client, error) {
 
 	// 所有探测已完成，按优先级选取成功者
 	for _, p := range pm.cfg.PreferredProviders {
+		if excluded[p] {
+			continue
+		}
 		if c, exists := results[p]; exists {
 			selected = c
 			return selected, nil
