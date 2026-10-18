@@ -1,0 +1,177 @@
+package portmapper
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"net"
+	"testing"
+	"time"
+)
+
+func startMockPCPGateway(t *testing.T) (*net.UDPConn, net.IP, int) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("failed to listen mock pcp: %v", err)
+	}
+
+	addr := conn.LocalAddr().(*net.UDPAddr)
+
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, remoteAddr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 60 {
+				continue
+			}
+
+			version := buf[0]
+			opcode := buf[1]
+			if version != 2 || opcode != 1 { // MAP
+				continue
+			}
+
+			lifetime := binary.BigEndian.Uint32(buf[4:8])
+			var nonce [12]byte
+			copy(nonce[:], buf[24:36])
+			proto := buf[36]
+			internalPort := binary.BigEndian.Uint16(buf[40:42])
+			suggestedExtPort := binary.BigEndian.Uint16(buf[42:44])
+
+			// 组装 60 字节的 PCP MAP 响应
+			resp := make([]byte, 60)
+			resp[0] = 2
+			resp[1] = 1 | 0x80 // 0x81
+			resp[2] = 0        // Reserved
+			resp[3] = 0        // Result Code: SUCCESS
+			binary.BigEndian.PutUint32(resp[4:8], lifetime)
+			binary.BigEndian.PutUint32(resp[8:12], 2000) // Epoch Time
+			// resp[12:24] Reserved 12 bytes
+
+			// MAP Payload
+			copy(resp[24:36], nonce[:])
+			resp[36] = proto
+			// resp[37:40] Reserved
+			binary.BigEndian.PutUint16(resp[40:42], internalPort)
+			if suggestedExtPort == 0 {
+				binary.BigEndian.PutUint16(resp[42:44], internalPort)
+			} else {
+				binary.BigEndian.PutUint16(resp[42:44], suggestedExtPort)
+			}
+
+			// Assigned External IP: 198.51.100.1
+			extIP := net.ParseIP("198.51.100.1")
+			copy(resp[44:60], extIP.To16())
+
+			_, _ = conn.WriteToUDP(resp, remoteAddr)
+		}
+	}()
+
+	return conn, addr.IP, addr.Port
+}
+
+func TestPCP_Unit(t *testing.T) {
+	conn, ip, port := startMockPCPGateway(t)
+	defer conn.Close()
+
+	clientIP := net.ParseIP("127.0.0.1")
+	client, err := NewPCPClientWithPort(ip, clientIP, port)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	if client.Provider() != ProviderPCP {
+		t.Errorf("expected provider %v, got %v", ProviderPCP, client.Provider())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 1. 获取公网 IP
+	extIP, err := client.GetExternalIP(ctx)
+	if err != nil {
+		t.Fatalf("GetExternalIP failed: %v", err)
+	}
+	if expected := "198.51.100.1"; extIP.String() != expected {
+		t.Errorf("expected external IP %s, got %s", expected, extIP)
+	}
+
+	// 2. TCP 端口映射
+	tcpMap, err := client.AddPortMapping(ctx, ProtocolTCP, 8080, 8080, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("AddPortMapping TCP failed: %v", err)
+	}
+	if tcpMap.ExternalPort != 8080 {
+		t.Errorf("expected external port 8080, got %d", tcpMap.ExternalPort)
+	}
+	if tcpMap.Lifetime != 1*time.Hour {
+		t.Errorf("expected lifetime 1h, got %v", tcpMap.Lifetime)
+	}
+	if tcpMap.Provider != ProviderPCP {
+		t.Errorf("expected provider PCP, got %v", tcpMap.Provider)
+	}
+
+	// 3. UDP 端口映射
+	udpMap, err := client.AddPortMapping(ctx, ProtocolUDP, 9000, 9000, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("AddPortMapping UDP failed: %v", err)
+	}
+	if udpMap.ExternalPort != 9000 {
+		t.Errorf("expected external port 9000, got %d", udpMap.ExternalPort)
+	}
+
+	// 4. 删除端口映射
+	if err := client.DeletePortMapping(ctx, tcpMap); err != nil {
+		t.Fatalf("DeletePortMapping failed: %v", err)
+	}
+}
+
+func TestPCP_AddressConversion(t *testing.T) {
+	ip4 := net.ParseIP("192.168.1.100")
+	addr := toPCPAddress(ip4)
+	back := fromPCPAddress(addr[:])
+	if !back.Equal(ip4) {
+		t.Errorf("address roundtrip failed: got %v, expected %v", back, ip4)
+	}
+
+	ip6 := net.ParseIP("2001:db8::1")
+	addr6 := toPCPAddress(ip6)
+	back6 := fromPCPAddress(addr6[:])
+	if !back6.Equal(ip6) {
+		t.Errorf("IPv6 roundtrip failed: got %v, expected %v", back6, ip6)
+	}
+}
+
+func TestPCP_Errors(t *testing.T) {
+	tests := []struct {
+		code uint8
+		err  error
+	}{
+		{0, nil},
+		{1, ErrUnsupportedVersion},
+		{2, ErrNotAuthorized},
+		{3, ErrMalformedResponse},
+		{4, ErrUnsupportedProtocol},
+		{7, ErrGatewayNetworkFailure},
+		{8, ErrNoResources},
+		{9, ErrUnsupportedProtocol},
+		{11, ErrMappingFailed},
+	}
+
+	for _, tt := range tests {
+		err := parsePCPResultCode(tt.code)
+		if tt.err == nil {
+			if err != nil {
+				t.Errorf("code %d: expected nil error, got %v", tt.code, err)
+			}
+		} else {
+			if !errors.Is(err, tt.err) {
+				t.Errorf("code %d: expected %v, got %v", tt.code, tt.err, err)
+			}
+		}
+	}
+}

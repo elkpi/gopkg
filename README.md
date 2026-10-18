@@ -20,7 +20,15 @@
   - **逐包 TTL 注入（`SendUDPWithTTL`）**：通过内核辅助控制报文（Ancillary OOB `IP_TTL` / `IPV6_UNICAST_HOPS`）在单一 UDP Socket 上发送指定 TTL 报文，无需全局修改 Socket 属性，完美支撑 NAT 穿透低 TTL 探测；
   - **目的地址安全前缀校验**：防止公网载体流量越权回绕至加密 Overlay 地址段。
 
-### 3. `security/securelog` — 密钥与敏感信息全编码递归脱敏引擎
+### 3. `net/portmapper` — 局域网网关端口映射三件套 (NAT-PMP / PCP / UPnP IGD)
+- **导入路径**：`github.com/elkpi/gopkg/net/portmapper`
+- **特性**：
+  - 纯 Go 原生实现，零外部大包依赖；
+  - 完整支持 **NAT-PMP** (RFC 6886)、**PCP** (RFC 6887) 与 **UPnP IGD** (SSDP M-SEARCH + SOAP XML)；
+  - 自动探测 Linux 系统缺省网关路由，支持三协议并发梯次探测（单播优先，UPnP 兜底）；
+  - 支持后台生命周期自动续期（`AutoRenew`）与退出注销（`Release`）。
+
+### 4. `security/securelog` — 密钥与敏感信息全编码递归脱敏引擎
 - **导入路径**：`github.com/elkpi/gopkg/security/securelog`
 - **特性**：
   - 纯 Go 标准库实现，零外部依赖；
