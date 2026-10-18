@@ -77,12 +77,21 @@ func NewUPnPClientFromLocation(ctx context.Context, locationURLStr string, httpC
 		return nil, err
 	}
 
-	svcType, ctrlURLStr, err := parseRootDeviceXML(body)
+	svcType, ctrlURLStr, urlBaseStr, err := parseRootDeviceXML(body)
 	if err != nil {
 		return nil, err
 	}
 
-	resolvedCtrlURL, err := locURL.Parse(ctrlURLStr)
+	// 设备描述显式给出 URLBase 时优先以其为基准解析相对 controlURL
+	base := locURL
+	if urlBaseStr != "" {
+		parsedBase, err := url.Parse(strings.TrimSpace(urlBaseStr))
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid URLBase %q: %v", ErrMalformedResponse, urlBaseStr, err)
+		}
+		base = parsedBase
+	}
+	resolvedCtrlURL, err := base.Parse(ctrlURLStr)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +156,7 @@ func (c *UPnPClient) getClientIP() (net.IP, error) {
 // XML 结构解析
 type upnpRoot struct {
 	XMLName xml.Name   `xml:"root"`
+	URLBase string     `xml:"URLBase"`
 	Device  upnpDevice `xml:"device"`
 }
 
@@ -164,18 +174,18 @@ type upnpService struct {
 	SCPDURL     string `xml:"SCPDURL"`
 }
 
-func parseRootDeviceXML(xmlData []byte) (serviceType, controlURL string, err error) {
+func parseRootDeviceXML(xmlData []byte) (serviceType, controlURL, urlBase string, err error) {
 	var root upnpRoot
 	if err := xml.Unmarshal(xmlData, &root); err != nil {
-		return "", "", fmt.Errorf("%w: invalid XML device desc: %v", ErrMalformedResponse, err)
+		return "", "", "", fmt.Errorf("%w: invalid XML device desc: %v", ErrMalformedResponse, err)
 	}
 
 	svcType, ctrlURL, found := findWANService(&root.Device)
 	if !found {
-		return "", "", fmt.Errorf("%w: no WANIPConnection or WANPPPConnection service found", ErrNoProviderAvailable)
+		return "", "", "", fmt.Errorf("%w: no WANIPConnection or WANPPPConnection service found", ErrNoProviderAvailable)
 	}
 
-	return svcType, ctrlURL, nil
+	return svcType, ctrlURL, root.URLBase, nil
 }
 
 func findWANService(dev *upnpDevice) (string, string, bool) {
@@ -207,6 +217,15 @@ type soapFaultEnvelope struct {
 			} `xml:"detail"`
 		} `xml:"Fault"`
 	} `xml:"Body"`
+}
+
+// xmlEscape 按 XML 文本节点规则转义，防止描述等自由文本破坏 SOAP 报文。
+func xmlEscape(s string) string {
+	var b strings.Builder
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return ""
+	}
+	return b.String()
 }
 
 func (c *UPnPClient) executeSOAP(ctx context.Context, action string, argsXML string) ([]byte, error) {
@@ -277,6 +296,10 @@ func (c *UPnPClient) AddPortMapping(ctx context.Context, proto Protocol, interna
 		leaseDuration = 0
 	}
 
+	c.mu.Lock()
+	description := c.description
+	c.mu.Unlock()
+
 	args := fmt.Sprintf(`
 <NewRemoteHost></NewRemoteHost>
 <NewExternalPort>%d</NewExternalPort>
@@ -286,7 +309,7 @@ func (c *UPnPClient) AddPortMapping(ctx context.Context, proto Protocol, interna
 <NewEnabled>1</NewEnabled>
 <NewPortMappingDescription>%s</NewPortMappingDescription>
 <NewLeaseDuration>%d</NewLeaseDuration>`,
-		preferredExternal, proto, internalPort, clientIP.String(), c.description, leaseDuration)
+		preferredExternal, proto, internalPort, clientIP.String(), xmlEscape(description), leaseDuration)
 
 	_, err = c.executeSOAP(ctx, "AddPortMapping", args)
 	if err != nil {
@@ -301,7 +324,7 @@ func (c *UPnPClient) AddPortMapping(ctx context.Context, proto Protocol, interna
 <NewEnabled>1</NewEnabled>
 <NewPortMappingDescription>%s</NewPortMappingDescription>
 <NewLeaseDuration>0</NewLeaseDuration>`,
-				preferredExternal, proto, internalPort, clientIP.String(), c.description)
+				preferredExternal, proto, internalPort, clientIP.String(), xmlEscape(description))
 			_, err = c.executeSOAP(ctx, "AddPortMapping", argsPermanent)
 			if err != nil {
 				return nil, err

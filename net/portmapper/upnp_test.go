@@ -2,7 +2,10 @@ package portmapper
 
 import (
 	"context"
+	"encoding/xml"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,7 +41,7 @@ const sampleRootXML = `<?xml version="1.0"?>
 </root>`
 
 func TestParseRootDeviceXML(t *testing.T) {
-	svcType, ctrlURL, err := parseRootDeviceXML([]byte(sampleRootXML))
+	svcType, ctrlURL, urlBase, err := parseRootDeviceXML([]byte(sampleRootXML))
 	if err != nil {
 		t.Fatalf("unexpected error parsing root XML: %v", err)
 	}
@@ -52,6 +55,9 @@ func TestParseRootDeviceXML(t *testing.T) {
 	if ctrlURL != expectedCtrl {
 		t.Errorf("expected control URL %s, got %s", expectedCtrl, ctrlURL)
 	}
+	if urlBase != "" {
+		t.Errorf("expected empty URLBase, got %s", urlBase)
+	}
 }
 
 func TestParseSSDPLocation(t *testing.T) {
@@ -64,6 +70,75 @@ func TestParseSSDPLocation(t *testing.T) {
 	expected := "http://192.168.1.1:1900/rootDesc.xml"
 	if loc != expected {
 		t.Errorf("expected location %s, got %s", expected, loc)
+	}
+}
+
+func TestUPnPClient_DescriptionIsXMLEscaped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rootDesc.xml" {
+			w.Header().Set("Content-Type", "text/xml")
+			_, _ = w.Write([]byte(sampleRootXML))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		dec := xml.NewDecoder(strings.NewReader(string(body)))
+		if err := dec.Decode(new(any)); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><Envelope><Body><AddPortMappingResponse/></Body></Envelope>`))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client, err := NewUPnPClientFromLocation(ctx, srv.URL+"/rootDesc.xml", srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetLocalIP(net.ParseIP("127.0.0.1"))
+	client.SetDescription("review & test")
+
+	if _, err := client.AddPortMapping(ctx, ProtocolTCP, 12345, 12345, time.Hour); err != nil {
+		t.Fatalf("包含 & 的合法描述破坏了 SOAP XML：%v", err)
+	}
+}
+
+func TestUPnPClient_HonorsURLBase(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rootDesc.xml" {
+			w.Header().Set("Content-Type", "text/xml")
+			fmt.Fprintf(w, `<?xml version="1.0"?>
+<root>
+  <URLBase>%s/service/</URLBase>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+        <controlURL>ctl/IPConn</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>`, srv.URL)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client, err := NewUPnPClientFromLocation(ctx, srv.URL+"/rootDesc.xml", srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := srv.URL + "/service/ctl/IPConn"; client.controlURL.String() != want {
+		t.Fatalf("controlURL = %s，期望按 URLBase 解析为 %s", client.controlURL, want)
 	}
 }
 
