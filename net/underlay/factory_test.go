@@ -9,6 +9,28 @@ import (
 	"testing"
 )
 
+func TestFactoryDialResolvesViaMarkedResolver(t *testing.T) {
+	previous := net.DefaultResolver
+	defer func() { net.DefaultResolver = previous }()
+
+	var defaultDials atomic.Int32
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			defaultDials.Add(1)
+			return nil, errors.New("default resolver must not be used for marked dialing")
+		},
+	}
+
+	f := NewFactory(7, func(uintptr, uint32) error { return errors.New("已到达带标记 socket 回调") })
+	// 目标是主机名：期望解析经由 f.Resolver()（其 Dial 会命中上面的 sentinel setter），
+	// 而默认解析器路径的拨号计数保持为 0。
+	_, _ = f.DialContext(context.Background(), "tcp4", "gopkg-review.invalid:12345")
+	if got := defaultDials.Load(); got != 0 {
+		t.Fatalf("DialContext 使用了默认 DNS 解析路径 %d 次，绕过了路由标记", got)
+	}
+}
+
 func TestFactoryMarkFailurePreventsPackets(t *testing.T) {
 	sentinel := errors.New("synthetic mark failure")
 	f := NewFactory(1, func(uintptr, uint32) error { return sentinel })
