@@ -5,20 +5,25 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/url"
+	"sort"
 	"strings"
 )
 
 // Redact 移除 text 中 sensitive 值及其 base64/hex/URL/JSON 表示。
+// 全部编码变体汇总后按最长优先替换，避免短 secret 前缀先行替换
+// 造成长 secret 的剩余后缀泄漏。
 func Redact(text string, sensitive []string) string {
+	var variants []string
 	for _, secret := range sensitive {
 		if secret == "" {
 			continue
 		}
-		variants := secretVariants(secret)
-		for _, variant := range variants {
-			if variant != "" && strings.Contains(text, variant) {
-				text = strings.ReplaceAll(text, variant, "[REDACTED]")
-			}
+		variants = append(variants, secretVariants(secret)...)
+	}
+	sort.Slice(variants, func(i, j int) bool { return len(variants[i]) > len(variants[j]) })
+	for _, variant := range variants {
+		if variant != "" && strings.Contains(text, variant) {
+			text = strings.ReplaceAll(text, variant, "[REDACTED]")
 		}
 	}
 	return text
