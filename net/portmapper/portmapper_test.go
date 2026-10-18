@@ -2,6 +2,7 @@ package portmapper
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -371,6 +372,90 @@ func TestPortMapper_ReleaseAll(t *testing.T) {
 
 	if !m1.IsReleased() || !m2.IsReleased() {
 		t.Error("expected both mappings to be released after ReleaseAll")
+	}
+}
+
+func TestPortMapper_FallsBackWhenMappingFails(t *testing.T) {
+	var pmpMaps atomic.Int32
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, remote, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 2 {
+				continue
+			}
+			var resp []byte
+			switch buf[0] {
+			case 2: // PCP
+				if n < 60 {
+					continue
+				}
+				resp = make([]byte, 60)
+				resp[0] = 2
+				if buf[1] == pcpOpcodeAnnounce {
+					resp[1] = pcpOpcodeAnnounce | pcpRespMask
+					copy(resp[44:60], net.IPv4(203, 0, 113, 7).To16())
+				} else if buf[1] == pcpOpcodeMap {
+					resp[1] = pcpOpcodeMap | pcpRespMask
+					copy(resp[24:44], buf[24:44])
+					copy(resp[44:60], net.IPv4(203, 0, 113, 7).To16())
+					if binary.BigEndian.Uint32(buf[4:8]) > 0 {
+						resp[3] = 8 // NO_RESOURCES：探测可通过，但映射创建失败
+					}
+				} else {
+					continue
+				}
+			case 0: // NAT-PMP
+				if buf[1] == natpmpOpExternalIP {
+					resp = make([]byte, 12)
+					resp[1] = natpmpRespOpExternalIP
+					copy(resp[8:12], net.IPv4(203, 0, 113, 7).To4())
+				} else if n >= 12 {
+					pmpMaps.Add(1)
+					resp = make([]byte, 16)
+					resp[1] = buf[1] + 128
+					copy(resp[8:12], buf[4:8])
+					copy(resp[12:16], buf[8:12])
+				} else {
+					continue
+				}
+			default:
+				continue
+			}
+			_, _ = conn.WriteToUDP(resp, remote)
+		}
+	}()
+
+	cfg := DefaultConfig()
+	cfg.GatewayIP = net.IPv4(127, 0, 0, 1)
+	cfg.LocalIP = cfg.GatewayIP
+	cfg.PCPPort = port
+	cfg.NATPMPPort = port
+	cfg.ProbeTimeout = 300 * time.Millisecond
+	cfg.PreferredProviders = []Provider{ProviderPCP, ProviderNATPMP}
+	pm, _ := New(cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	m, err := pm.Discover(ctx, 12345, 12345)
+	if err != nil {
+		t.Fatalf("PCP 映射失败后应回退到 NAT-PMP：%v", err)
+	}
+	if m.Provider != ProviderNATPMP {
+		t.Fatalf("期望回退到 NAT-PMP，实际 %v", m.Provider)
+	}
+	if got := pmpMaps.Load(); got == 0 {
+		t.Fatal("NAT-PMP 从未收到映射请求")
 	}
 }
 
